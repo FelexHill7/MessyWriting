@@ -5,21 +5,27 @@ Serves a single-page app where users drag-and-drop or upload a prescription
 image.  The image is sent to the /predict endpoint, passed through the
 CRNN model, and the decoded text is returned as JSON.
 
-Delegates model loading and inference to predict.py.
-HTML template lives in templates/index.html.
+Delegates model loading and inference to services/inference.py.
+HTML template lives in web/templates/index.html.
 
 Run:   python app.py
 Visit: http://localhost:5000
 """
 
 import io
+import os
 from flask import Flask, request, jsonify, render_template
 from PIL import Image
 
-from predict import predict_pil
+from services.inference import predict_pil
 
 # ── Flask app ─────────────────────────────────────────────────────────────────
-app = Flask(__name__)
+_web_dir = os.path.dirname(os.path.abspath(__file__))
+app = Flask(
+    __name__,
+    template_folder=os.path.join(_web_dir, "templates"),
+    static_folder=os.path.join(_web_dir, "static"),
+)
 
 
 @app.route("/")

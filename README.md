@@ -1,40 +1,87 @@
 # RxRead — Doctor Handwriting Recognition
 
-A deep-learning pipeline that reads messy handwritten text from prescription images. Built with a **CRNN + Attention** model trained on the [GNHK](https://doi.org/10.1109/ICDAR.2021.00060) wild-handwriting dataset (+ optional synthetic data), with beam search decoding, test-time augmentation, and character language model rescoring. Served through a clean Flask web interface.
+A deep-learning pipeline that reads messy handwritten text from prescription images. Built with a **ResNet-CRNN + Attention + CTC** model trained on the [GNHK](https://doi.org/10.1109/ICDAR.2021.00060) wild-handwriting dataset (+ optional IAM and synthetic data), with beam search decoding, test-time augmentation, and character language model rescoring. Served through a clean Flask web interface.
+
+---
+
+## Change History Since Last Push
+
+Current branch is aligned with `origin/master` (no new local commits ahead of remote), but there are local working-tree updates not yet pushed.
+
+### Local architecture and code changes
+
+- Migrated from flat files to a layered package structure:
+        - Added `config.py`
+        - Added `core/`, `pipeline/`, `services/`, `web/`
+        - Replaced old top-level modules (`model.py`, `dataset.py`, `train.py`, `predict.py`, `app.py`, `generate_synthetic.py`)
+- Updated CLI orchestration in `main.py` for the new package layout.
+- Updated dependencies in `requirements.txt`.
+- Updated the analysis notebook in `notebooks/training_curves.ipynb` for new imports/paths.
+
+### Local assets and UI changes
+
+- Updated generated training plots in `static/plots/`.
+- Moved web assets into `web/` and removed legacy top-level `templates/` and `static/` usage in app code.
+
+### Notes
+
+- These changes are in the working tree and need to be committed and pushed to appear in remote history.
+
+---
+
+## Method Evolution (What Changed and Why)
+
+This section summarizes the major method decisions made over time and the rationale behind each change.
+
+| Phase | Previous method | Current method | Why it changed |
+|------|------------------|----------------|----------------|
+| 1. Visual encoder | Custom shallow CNN feature extractor | ResNet-18 backbone in `ResNetCRNN` | Better transfer learning, stronger low-level features, and faster convergence on handwriting variability. |
+| 2. Sequence model | BiLSTM + CTC (baseline) | BiLSTM + Attention + CTC | Attention improved focus on informative timesteps while keeping CTC alignment-free training. |
+| 3. Decoding | Greedy CTC decode only | Beam search + optional char-LM rescoring (+ TTA at inference) | Better transcription quality and fewer implausible character sequences. |
+| 4. Data sources | GNHK only | GNHK + optional synthetic + optional IAM | Improve generalization and style diversity; reduce overfitting to one handwriting distribution. |
+| 5. Training strategy | Single LR, simpler scheduler, per-epoch full validation | AdamW, differential LR (backbone/head), OneCycleLR, sampled CER + periodic full CER | Faster training iterations with stable optimization and lower validation overhead. |
+| 6. Throughput | Slower data/validation loop | Multi-worker DataLoader, AMP on CUDA, grad accumulation, less frequent plotting | Reduce epoch wall-clock time without changing model quality targets. |
+| 7. Code organization | Flat file layout (`model.py`, `train.py`, etc.) | Layered structure: `core/`, `pipeline/`, `services/`, `web/`, `config.py` | Improve cohesion, reduce coupling, and make training/inference/web concerns easier to maintain. |
+
+### Notes on CTC vs ResNet
+
+- The project did **not** replace CTC with ResNet; these are different parts of the system.
+- **ResNet** is the visual backbone (feature extractor).
+- **CTC** is still the sequence training objective/decoder interface.
+- Current stack is: **ResNet backbone + BiLSTM + Attention + CTC**.
 
 ---
 
 ## Architecture
 
-### CRNN + Attention Pipeline
+### ResNet-CRNN + Attention + CTC Pipeline
 
 ```
 Input Image (32×128, grayscale)
         │
         ▼
 ┌──────────────────────────┐
-│     CNN Feature Extractor │   7 Conv2d layers, BatchNorm, ReLU, MaxPool
-│     (1 → 64 → 128 → 256  │   Reduces 32×128 → 1×W' spatial map
-│      → 512 channels)      │   ~2.4M parameters
+│   ResNet-18 Backbone      │   conv1(1ch), stride tweaks in layer3/4
+│   + AdaptiveAvgPool2d     │   preserves sequence width for CTC
 └──────────┬───────────────┘
-           │  (B, 512, W')
+           │  (B, T, 512)
            ▼
 ┌──────────────────────────┐
-│    Bidirectional LSTM     │   256 hidden units × 2 directions = 512
-│    (2 layers, dropout=0.3)│   Captures left-to-right & right-to-left context
+│    Bidirectional LSTM     │   3 layers, 256 hidden units × 2 directions
+│    + dropout              │   Captures left-to-right & right-to-left context
 └──────────┬───────────────┘
-           │  (B, W', 512)
+           │  (B, T, 512)
            ▼
 ┌──────────────────────────┐
 │    Additive Attention     │   Focuses on relevant spatial positions
 │    (residual connection)  │   Query-based soft attention over timesteps
 └──────────┬───────────────┘
-           │  (B, W', 512)
+           │  (B, T, 512)
            ▼
 ┌──────────────────────────┐
-│      Linear Classifier    │   512 → num_classes (81 chars + 1 CTC blank)
+│      Linear Classifier    │   512 → num_classes (len(CHARS)+1)
 └──────────┬───────────────┘
-           │  (W', B, 82)
+           │  (T, B, C)
            ▼
   CTC Beam Search Decode
    + LM Rescoring + TTA
@@ -47,8 +94,8 @@ Input Image (32×128, grayscale)
 
 | Stage | What it does | Details |
 |-------|-------------|---------|
-| **CNN backbone** | Extracts visual features from a grayscale word image | 7 Conv2d layers with ReLU activation, BatchNorm on deeper layers, MaxPool to reduce spatial dimensions. Asymmetric pooling `(2,1)` preserves horizontal resolution for character sequence. |
-| **Bidirectional LSTM** | Reads the feature sequence in both directions | 256 hidden units per direction (512 total output). Captures left-to-right *and* right-to-left context so each character prediction is informed by its neighbours. |
+| **ResNet backbone** | Extracts visual features from a grayscale word image | ResNet-18 backbone adapted for 1-channel input with stride modifications to preserve temporal width. |
+| **Bidirectional LSTM** | Reads the feature sequence in both directions | 3-layer BiLSTM with 256 hidden units per direction (512 output features per timestep). |
 | **Attention** | Focuses on relevant spatial positions | Additive attention computes weighted context over all timesteps with a residual connection. Helps the classifier attend to the most informative positions for each character. |
 | **CTC decoder** | Aligns predictions to variable-length text | CTC loss for training (alignment-free). Inference uses **beam search** (width 10) with **character LM rescoring** and **test-time augmentation** (5 views). Greedy decode available as a faster fallback. |
 
@@ -59,20 +106,22 @@ Input Image (32×128, grayscale)
 | Parameter | Value |
 |-----------|-------|
 | Input size | 32 × 128 × 1 (H × W × C, grayscale) |
-| Character set | 80 printable ASCII chars (letters, digits, punctuation, space) |
-| Vocabulary size | 82 (80 chars + CTC blank + padding) |
-| CNN channels | 1 → 64 → 128 → 256 → 256 → 512 → 512 → 512 |
-| CNN activations | ReLU (all layers), BatchNorm (layers 5–6) |
-| RNN type | BiLSTM, 2 layers, 256 hidden per direction |
-| Optimizer | Adam (lr = 0.001, weight_decay = 1e-4) |
-| LR schedule | OneCycleLR (cosine anneal per batch) |
-| Batch size | 64 |
-| Epochs | 50 (with early stopping, patience = 7) |
-| Loss function | CTC Loss (blank = 0, zero_infinity = True) |
-| Gradient clipping | max_norm = 5 |
-| Regularisation | Dropout2d (0.3) in CNN, Dropout (0.3) after BiLSTM, L2 weight decay |
-| Data augmentation | GPU batch: affine, elastic distortion, brightness/contrast, Gaussian blur, morphological erosion/dilation |
-| Preprocessing | Grayscale → Resize(32×128) → ToTensor → Normalize(0.5, 0.5) |
+| Character set | Printable ASCII from `config.CHARS` |
+| Vocabulary size | `len(CHARS) + 1` (CTC blank at index 0) |
+| Visual backbone | ResNet-18 (ImageNet init) adapted for grayscale + width-preserving strides |
+| RNN type | BiLSTM, 3 layers, 256 hidden per direction |
+| Attention | Additive attention with residual fusion |
+| Optimizer | AdamW (differential LR: backbone + head) |
+| Base LR | `3e-4` (`config.LR`) |
+| LR schedule | OneCycleLR (cosine, `pct_start=0.1`) |
+| Batch size | `64` |
+| Epochs | `80` max with early stopping (`patience=10`) |
+| Gradient accumulation | `2` steps |
+| Loss function | CTC Loss (`blank=0`, `zero_infinity=True`) |
+| Gradient clipping | `max_norm=5` |
+| Regularisation | Dropout (0.3), weight decay `1e-4` |
+| Data augmentation | GPU batch affine/elastic/photometric/morphological transforms |
+| Validation cadence | Sampled CER on most epochs, full CER every 5 epochs |
 
 ---
 
@@ -80,18 +129,27 @@ Input Image (32×128, grayscale)
 
 ```
 ├── main.py                # Single entry point — train / predict / serve
-├── model.py               # CRNN architecture (CNN + BiLSTM + linear head)
-├── dataset.py             # Data loader — GNHK + synthetic data support
-├── train.py               # Training loop with validation, LR scheduling, checkpointing
-├── predict.py             # Prediction module (beam search + greedy CTC decode)
-├── generate_synthetic.py  # Synthetic handwriting data generator (trdg)
-├── app.py                 # Flask web app — routes only (thin controller)
+├── config.py              # Global paths, charset, and training hyperparameters
+├── core/
+│   ├── model.py           # ResNetCRNN + Attention architecture
+│   ├── decoding.py        # CTC greedy/beam decoding + char LM
+│   └── metrics.py         # CER and alignment metrics
+├── pipeline/
+│   ├── dataset.py         # GNHK/IAM/synthetic dataset loaders + collate
+│   ├── preprocessing.py   # Base transforms, TTA, GPU augmentation
+│   └── generate_synthetic.py
+├── services/
+│   ├── training.py        # Training loop, checkpoints, history, early stopping
+│   ├── inference.py       # Inference + segmentation + TTA + beam decode
+│   └── evaluation.py      # Curves and confusion matrix generation
+├── web/
+│   ├── app.py             # Flask app
+│   ├── templates/
+│   │   └── index.html
+│   └── static/
+│       └── plots/
 ├── notebooks/
 │   └── training_curves.ipynb  # Jupyter notebook — individual training plots
-├── templates/
-│   └── index.html    # Prescription-pad styled drag-and-drop UI
-├── static/
-│   └── plots/        # Individual training plot images
 ├── checkpoints/      # Model weights (gitignored)
 ├── outputs/          # Training curves & history (gitignored)
 ├── requirements.txt
@@ -104,14 +162,12 @@ Input Image (32×128, grayscale)
 
 ### File Details
 
-- **`main.py`** — Single entry point that dispatches to train, predict, or serve. Run `python main.py` to see all available commands.
-- **`model.py`** — Defines the `CRNN` class: a 7-layer CNN feature extractor with Dropout2d → 2-layer bidirectional LSTM (256 hidden units per direction) with dropout → **additive attention** with residual connection → linear classifier projecting each timestep to the character vocabulary.
-- **`dataset.py`** — Loads two data sources: (1) GNHK directory tree (JSON polygon annotations → axis-aligned bounding box crops) and (2) synthetic data (PNG images + labels.json). Both are pre-cached as tensors in memory at init. `build_dataset()` combines them automatically if synthetic data exists.
-- **`train.py`** — Runs the full training loop: builds DataLoaders with a custom CTC-compatible collate function, trains for up to 50 epochs with Adam + OneCycleLR scheduling + weight decay, mixed precision (AMP), GPU batch augmentation, gradient clipping, early stopping after 7 epochs without improvement, and saves the best checkpoint by validation loss.
-- **`predict.py`** — Shared module used by both the web app and the CLI. Loads model weights once, exposes `predict_pil()` and `predict_file()` with **beam search CTC decoding** (beam width 10, ~2-5% more accurate than greedy). Greedy decode also available via `use_beam=False`.
-- **`generate_synthetic.py`** — Generates synthetic handwriting word images using `trdg` (TextRecognitionDataGenerator). Produces distorted, handwriting-style text with random skew, blur, and noise. Outputs PNG images + `labels.json`. Run before training to supplement GNHK data.
-- **`app.py`** — Flask server with two routes: `/` serves the UI, `/predict` accepts image uploads and returns JSON. All inference logic is delegated to `predict.py`.
-- **`templates/index.html`** — Polished single-page UI styled as a ruled-paper prescription pad with drag-and-drop, preview, spinner, and result display.
+- **`main.py`** — Entry point for train/serve/predict commands.
+- **`core/model.py`** — `ResNetCRNN` model definition.
+- **`pipeline/dataset.py`** — Dataset loaders for GNHK, IAM, and synthetic sources.
+- **`services/training.py`** — Training orchestration, scheduling, checkpoints, and history export.
+- **`services/inference.py`** — Runtime prediction pipeline for CLI and web app.
+- **`web/app.py`** — Flask routes and server startup.
 
 ---
 
@@ -132,7 +188,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 #    (see https://doi.org/10.1109/ICDAR.2021.00060)
 
 # 5. (Optional) Generate synthetic training data
-python generate_synthetic.py --count 50000
+python -m pipeline.generate_synthetic --count 50000
 
 # 6. Full pipeline — trains (if needed) then launches the web app
 python main.py
@@ -228,12 +284,11 @@ The GNHK dataset (32K training samples) with a 2.4M parameter model is prone to 
 
 | Technique | What changed | File |
 |-----------|-------------|------|
-| **Dropout (CNN)** | `Dropout2d(0.3)` after the 2nd and 4th conv blocks | `model.py` |
-| **Dropout (RNN)** | 2-layer BiLSTM with inter-layer dropout + `Dropout(0.3)` after BiLSTM output | `model.py` |
-| **GPU batch augmentation** | Affine transforms, elastic distortion, brightness/contrast, Gaussian blur, morphological erosion/dilation — all on GPU at batch level | `train.py` |
-| **Weight decay** | L2 regularisation via `Adam(weight_decay=1e-4)` | `train.py` |
-| **Early stopping** | Halt training after 7 epochs with no val loss improvement | `train.py` |
-| **Synthetic data** | Optional 50K generated word images via `trdg` to supplement training | `generate_synthetic.py` |
+| **Dropout (CNN/RNN)** | Dropout in CNN feature stack and recurrent stack | `core/model.py` |
+| **GPU batch augmentation** | Affine transforms, elastic distortion, brightness/contrast, blur, morphological ops — all on GPU at batch level | `pipeline/preprocessing.py` |
+| **Weight decay** | L2 regularisation via `AdamW(weight_decay=1e-4)` | `services/training.py` |
+| **Early stopping** | CER-based early stopping on full-validation checkpoints | `services/training.py` |
+| **Synthetic data** | Optional generated word images to supplement training | `pipeline/generate_synthetic.py` |
 
 ### Accuracy Improvements
 

@@ -1,8 +1,8 @@
 """
 main.py — Single entry point for the RxRead pipeline.
 
-Delegates to train.py, predict.py, and app.py so nothing else needs to be
-run directly.  All paths and configuration live here.
+Delegates to services/ and web/ packages so nothing else needs to be
+run directly.  All paths and configuration live in config.py.
 
 Usage:
     python main.py                    Train the model, then launch the web UI
@@ -24,40 +24,41 @@ def main():
     command = sys.argv[1].lower() if len(sys.argv) >= 2 else "all"
 
     if command == "train":
-        from train import train
+        from services.training import train
         train()
         print("\nTraining complete. Launching web UI...\n")
-        from app import run_server
+        from web.app import run_server
         run_server()
 
     elif command == "serve":
-        from app import run_server
+        from web.app import run_server
         run_server()
 
     elif command == "predict":
         if len(sys.argv) < 3:
             print("Usage: python main.py predict <image_path>")
             return
-        from predict import predict_file
+        from services.inference import predict_file
         print(predict_file(sys.argv[2]))
 
     elif command == "all":
         # Full pipeline: train (if no weights exist) → launch web UI
+        from config import BEST_WEIGHTS, FINAL_WEIGHTS
         weights_exist = (
-            os.path.exists("checkpoints/crnn_gnhk_best.pth")
-            or os.path.exists("checkpoints/crnn_gnhk.pth")
+            os.path.exists(BEST_WEIGHTS)
+            or os.path.exists(FINAL_WEIGHTS)
         )
 
         if not weights_exist:
             print("No trained model found — starting training...\n")
-            from train import train
+            from services.training import train
             train()
             print()
         else:
             print("Trained model found — skipping training.")
 
         print("Launching web UI...\n")
-        from app import run_server
+        from web.app import run_server
         run_server()
 
     else:
