@@ -25,7 +25,7 @@ from torch.utils.data import Dataset, ConcatDataset, DataLoader, WeightedRandomS
 from PIL import Image
 
 from config import encode_text, BATCH_SIZE, NUM_WORKERS
-from pipeline.preprocessing import base_transform
+from .preprocessing import base_transform
 
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff")

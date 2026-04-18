@@ -28,7 +28,7 @@ from config import (
 from core.model import ResNetCRNN
 from pipeline.dataset import GNHKDataset, build_weighted_train_set, build_dataloader
 from pipeline.preprocessing import gpu_augment
-from core.decoding import ctc_beam_decode_batch, CharLM
+from core.decoding import ctc_beam_decode_batch, ctc_greedy_decode_batch, CharLM
 from core.metrics import char_error_rate
 from services.evaluation import plot_training_curves, generate_confusion_matrix
 
@@ -160,7 +160,8 @@ def train():
                 if cer_budget is not None and total_words >= cer_budget:
                     continue
 
-                decoded = ctc_beam_decode_batch(outputs, beam_width=5)
+                decoded = ctc_greedy_decode_batch(outputs)
+
                 for pred_text, gt_text in zip(decoded, ground_truths):
                     if cer_budget is not None and total_words >= cer_budget:
                         break
