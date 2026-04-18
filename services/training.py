@@ -6,7 +6,7 @@ checkpointing, and post-training evaluation. All domain logic is delegated
 to focused modules.
 
 Usage:
-    python train.py
+    python main.py train
 """
 
 import os
@@ -15,7 +15,6 @@ import math
 import time
 
 import torch
-from torch.utils.data import DataLoader
 from torch.nn import CTCLoss
 
 from config import (
@@ -24,16 +23,14 @@ from config import (
     NUM_CLASSES, BATCH_SIZE, EPOCHS, LR, WEIGHT_DECAY,
     PATIENCE, ACCUMULATION_STEPS, GRAD_CLIP_NORM,
     BACKBONE_LR_MULT, ONECYCLE_PCT_START, AUGMENT_START_EPOCH,
-    NUM_WORKERS, PREFETCH_FACTOR,
     VAL_CER_SAMPLE_LIMIT, FULL_VAL_INTERVAL, PLOT_EVERY_N_EPOCHS,
 )
 from core.model import ResNetCRNN
-from pipeline.dataset import GNHKDataset, IAMDataset, SyntheticDataset, collate_fn
+from pipeline.dataset import GNHKDataset, build_weighted_train_set, build_dataloader
 from pipeline.preprocessing import gpu_augment
-from core.decoding import ctc_greedy_decode_batch, ctc_beam_decode_batch, CharLM
+from core.decoding import ctc_beam_decode_batch, CharLM
 from core.metrics import char_error_rate
 from services.evaluation import plot_training_curves, generate_confusion_matrix
-from torch.utils.data import WeightedRandomSampler, ConcatDataset
 
 
 def _collect_training_texts(dataset):
@@ -59,33 +56,16 @@ def train():
         torch.backends.cudnn.benchmark = True
 
     # ── Data ──────────────────────────────────────────────────────────────────
+    train_set, sampler = build_weighted_train_set(
+        gnhk_dir=TRAIN_DIR,
+        iam_dir=IAM_DIR,
+        synthetic_dir=SYNTHETIC_DIR,
+    )
     val_set = GNHKDataset(TEST_DIR)
-    gnhk = GNHKDataset(TRAIN_DIR)
-    iam = IAMDataset(IAM_DIR) if IAM_DIR and os.path.isdir(IAM_DIR) else None
-    syn = SyntheticDataset(SYNTHETIC_DIR) if SYNTHETIC_DIR and os.path.isdir(SYNTHETIC_DIR) else None
-
-    datasets, weights = [gnhk], [3.0] * len(gnhk)
-    if iam and len(iam) > 0:
-        datasets.append(iam)
-        weights += [1.0] * len(iam)
-    if syn and len(syn) > 0:
-        datasets.append(syn)
-        weights += [2.0] * len(syn)  # synthetic is cleaner than IAM, weight middle
-
-    train_set = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
     print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)}")
 
-    sampler = WeightedRandomSampler(weights, num_samples=len(train_set), replacement=True)
-
-    loader_kwargs = dict(
-    collate_fn=collate_fn,
-    num_workers=0,
-    pin_memory=(device.type == "cuda"),
-    )
-
-    # shuffle must be False when using a sampler
-    train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, sampler=sampler, **loader_kwargs)
-    val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, **loader_kwargs)
+    train_loader = build_dataloader(train_set, sampler=sampler)
+    val_loader = build_dataloader(val_set)
 
     # ── Model & optimiser ─────────────────────────────────────────────────────
     model = ResNetCRNN(NUM_CLASSES).to(device)

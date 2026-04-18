@@ -5,6 +5,15 @@ Each dataset class reads its source format, crops/loads word images,
 and pre-caches tensors at init for I/O-free training.
 
 Depends on: config (constants), preprocessing (base_transform).
+
+Public API:
+    - GNHKDataset              — GNHK handwriting corpus
+    - IAMDataset               — IAM handwriting database
+    - SyntheticDataset         — synthetic trdg images
+    - build_weighted_train_set — combine sources with GNHK-biased sampling
+    - build_dataloader         — construct a DataLoader with project settings
+    - collate_fn               — CTC-compatible batch collation
+    - build_dataset            — legacy unweighted combiner (kept for compat)
 """
 
 import os
@@ -12,10 +21,10 @@ import json
 import unicodedata
 import cv2
 import torch
-from torch.utils.data import Dataset, ConcatDataset
+from torch.utils.data import Dataset, ConcatDataset, DataLoader, WeightedRandomSampler
 from PIL import Image
 
-from config import encode_text
+from config import encode_text, BATCH_SIZE, NUM_WORKERS
 from pipeline.preprocessing import base_transform
 
 
@@ -30,6 +39,12 @@ MAPPING_FILES = (
     "val_gt.txt",
     "linux_gt.txt",
 )
+
+# Sampling weights per source — GNHK is the target domain so it gets
+# oversampled relative to IAM (clean British) and synthetic data.
+_GNHK_WEIGHT = 3.0
+_IAM_WEIGHT = 1.0
+_SYNTHETIC_WEIGHT = 2.0
 
 
 def _normalize_text_for_charset(text):
@@ -53,8 +68,6 @@ class GNHKDataset(Dataset):
     """
 
     def __init__(self, root_dir):
-        # Walk the full directory tree so we find JSONs inside sub-folders
-        # (e.g. train_data/train/*.json, test_data/test/*.json)
         samples = []
         for dirpath, _, filenames in os.walk(root_dir):
             for fname in filenames:
@@ -74,8 +87,6 @@ class GNHKDataset(Dataset):
                 if image is None:
                     continue
 
-                # GNHK annotations are a flat list of dicts, each with
-                # "text" and "polygon" (x0,y0 … x3,y3 quadrilateral).
                 for obj in data:
                     text = obj.get("text", "").strip()
                     if not text or text in ["###", ""]:
@@ -85,7 +96,6 @@ class GNHKDataset(Dataset):
                     if polygon is None:
                         continue
 
-                    # Derive an axis-aligned bounding box from the polygon
                     xs = [polygon[k] for k in ("x0", "x1", "x2", "x3")]
                     ys = [polygon[k] for k in ("y0", "y1", "y2", "y3")]
                     x_min, x_max = max(min(xs), 0), max(xs)
@@ -97,8 +107,6 @@ class GNHKDataset(Dataset):
 
                     samples.append((crop, text))
 
-        # Pre-cache all base tensors (grayscale + resize + toTensor)
-        # Then free raw numpy crops to save RAM
         self.cached = []
         for crop, text in samples:
             pil_img = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
@@ -140,7 +148,6 @@ class SyntheticDataset(Dataset):
             if not text:
                 continue
 
-            # Filter to only chars the model knows
             encoded = encode_text(text)
             if not encoded:
                 continue
@@ -273,7 +280,6 @@ class IAMDataset(Dataset):
         if not mapping_paths:
             return 0
 
-        # Build image lookup to support mapping by relative path OR stem id.
         image_by_rel = {}
         image_by_stem = {}
         for dirpath, _, filenames in os.walk(root_dir):
@@ -364,10 +370,72 @@ def collate_fn(batch):
     return images, labels_concat, label_lengths, texts
 
 
+def build_weighted_train_set(gnhk_dir, iam_dir=None, synthetic_dir=None):
+    """Build a weighted training dataset biased toward the target domain (GNHK).
+
+    GNHK is oversampled since the val set is pure GNHK. IAM and synthetic
+    data still contribute character diversity and act as regularisers.
+
+    Returns:
+        train_set: ConcatDataset (or single Dataset if only GNHK present)
+        sampler:   WeightedRandomSampler for use with DataLoader
+    """
+    gnhk = GNHKDataset(gnhk_dir)
+    print(f"  GNHK samples: {len(gnhk)}")
+
+    datasets = [gnhk]
+    weights = [_GNHK_WEIGHT] * len(gnhk)
+
+    if iam_dir and os.path.isdir(iam_dir):
+        iam = IAMDataset(iam_dir)
+        if len(iam) > 0:
+            print(f"  IAM samples: {len(iam)}")
+            datasets.append(iam)
+            weights += [_IAM_WEIGHT] * len(iam)
+
+    if synthetic_dir and os.path.isdir(synthetic_dir):
+        syn = SyntheticDataset(synthetic_dir)
+        if len(syn) > 0:
+            print(f"  Synthetic samples: {len(syn)}")
+            datasets.append(syn)
+            weights += [_SYNTHETIC_WEIGHT] * len(syn)
+
+    train_set = ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+    print(f"  Total combined: {len(train_set)}")
+
+    sampler = WeightedRandomSampler(weights, num_samples=len(train_set), replacement=True)
+    return train_set, sampler
+
+
+def build_dataloader(dataset, sampler=None, shuffle=False):
+    """Construct a DataLoader with project-standard settings.
+
+    All DataLoader configuration is owned here so callers (training, eval)
+    remain decoupled from loader mechanics.
+
+    Args:
+        dataset: Any PyTorch Dataset.
+        sampler: Optional WeightedRandomSampler (disables shuffle).
+        shuffle: Whether to shuffle — ignored when sampler is provided.
+    """
+    return DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        sampler=sampler,
+        shuffle=shuffle and sampler is None,
+        collate_fn=collate_fn,
+        num_workers=NUM_WORKERS,
+        pin_memory=torch.cuda.is_available(),
+    )
+
+
 def build_dataset(gnhk_dir, synthetic_dir=None, iam_dir=None):
     """Build a combined dataset from GNHK + optional IAM + optional synthetic data.
 
     Returns a single Dataset. Missing or empty sources are silently skipped.
+
+    Note: prefer build_weighted_train_set for training — this function
+    returns an unweighted dataset for backward compatibility.
     """
     datasets = []
 
