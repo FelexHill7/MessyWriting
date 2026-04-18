@@ -159,7 +159,7 @@ def train():
 
                 if cer_budget is not None and total_words >= cer_budget:
                     continue
-
+                
                 decoded = ctc_greedy_decode_batch(outputs)
 
                 for pred_text, gt_text in zip(decoded, ground_truths):
