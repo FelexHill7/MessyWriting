@@ -1,4 +1,4 @@
-# RxRead — Doctor Handwriting Recognition
+# RxRead — Doctor Handwriting Recognition (WIP)
 
 A deep-learning pipeline that reads messy handwritten text from prescription images. Built with a **ResNet-CRNN + Attention + CTC** model trained on the [GNHK](https://doi.org/10.1109/ICDAR.2021.00060) wild-handwriting dataset (+ optional IAM and synthetic data), with beam search decoding, test-time augmentation, and character language model rescoring. Served through a clean Flask web interface.
 
